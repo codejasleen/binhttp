@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""bserve -- a BHTP/1 static file server (Track 1).
+
+Usage:  bserve [-v] ROOT PORT
+
+    ROOT   directory to serve files from
+    PORT   TCP port to listen on (all interfaces, IPv4 + IPv6 where possible)
+    -v     hexdump every frame received and sent to stderr
+
+This file is deliberately self-contained: it shares no code with bcurl.
+Everything it knows about the wire format comes from SPEC.md, so the client
+and server can only agree if the spec is complete.
+"""
+import mimetypes
+import os
+import socket
+import struct
+import sys
+import threading
+import urllib.parse
+from email.utils import formatdate
+
+# ---------------------------------------------------------------- wire format
+# SPEC 2: 8-octet frame header, big-endian.
+#   Length (24) | Type (8) | Flags (8) | Reserved (8) | Request ID (16)
+# The first 32 bits are packed as one integer: (length << 8) | type.
+FRAME_HEADER = struct.Struct(">IBBH")
+HEADER_LEN = FRAME_HEADER.size          # 8
+MAX_FRAME_SIZE = 16384                  # SPEC 2: largest payload in v1
+
+T_HEADERS = 0x01                        # SPEC 3
+T_DATA = 0x02
+TYPE_NAMES = {T_HEADERS: "HEADERS", T_DATA: "DATA"}
+F_END = 0x01                            # last frame of this message
+
+# SPEC 4: static name table. Index 0 = literal name follows.
+STATIC_TABLE = (None, ":method", ":path", ":status", "host", "user-agent",
+                "accept", "content-type", "content-length", "server", "date")
+NAME_TO_INDEX = {name: i for i, name in enumerate(STATIC_TABLE) if name}
+
+SERVER_NAME = "bserve/1.0"
+IDLE_TIMEOUT = 60                       # seconds without a frame -> close
+ALLOWED_METHODS = ("GET", "HEAD")
+REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found",
+           405: "Method Not Allowed", 500: "Internal Server Error"}
+
+
+class Malformed(Exception):
+    """Bad request content. Answer 400 on that request ID; keep the connection."""
+
+
+class FramingError(Exception):
+    """Frame boundaries can no longer be trusted. Answer 400 on ID 0; close."""
+
+
+def encode_block(fields):
+    """[(name, value)] -> header block octets (SPEC 4)."""
+    out = bytearray()
+    for name, value in fields:
+        if isinstance(value, str):
+            value = value.encode("latin-1")
+        index = NAME_TO_INDEX.get(name)
+        if index:
+            out.append(index)
+        else:
+            raw = name.encode("ascii")
+            out += bytes([0, len(raw)]) + raw
+        out += len(value).to_bytes(2, "big") + value
+    return bytes(out)
+
+
+def decode_block(payload):
+    """Header block octets -> [(name, value bytes)]. Raises Malformed."""
+    fields, i, n = [], 0, len(payload)
+    while i < n:
+        index = payload[i]
+        i += 1
+        if index == 0:
+            if i >= n:
+                raise Malformed("header block truncated in name length")
+            name_len = payload[i]
+            i += 1
+            if name_len == 0:
+                raise Malformed("literal header name has length 0")
+            if i + name_len > n:
+                raise Malformed("header block truncated in name")
+            try:
+                name = payload[i:i + name_len].decode("ascii").lower()
+            except UnicodeDecodeError:
+                raise Malformed("header name is not ASCII") from None
+            i += name_len
+        elif index < len(STATIC_TABLE):
+            name = STATIC_TABLE[index]
+        else:
+            raise Malformed(f"unknown static table index {index}")
+        if i + 2 > n:
+            raise Malformed(f"header block truncated in length of {name!r}")
+        value_len = int.from_bytes(payload[i:i + 2], "big")
+        i += 2
+        if i + value_len > n:
+            raise Malformed(f"header block truncated in value of {name!r}")
+        fields.append((name, payload[i:i + value_len]))
+        i += value_len
+    return fields
+
+
+def pack_frame(ftype, flags, request_id, payload=b""):
+    return FRAME_HEADER.pack(len(payload) << 8 | ftype, flags, 0, request_id) + payload
+
+
+def hexdump(data, prefix):
+    lines = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hexes = " ".join(f"{b:02x}" for b in chunk[:8])
+        if len(chunk) > 8:
+            hexes += "  " + " ".join(f"{b:02x}" for b in chunk[8:])
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{prefix} {off:08x}  {hexes:<49} |{text}|")
+    return "\n".join(lines)
+
+
+def describe_frame(direction, frame):
+    lt, flags, reserved, rid = FRAME_HEADER.unpack(frame[:HEADER_LEN])
+    length, ftype = lt >> 8, lt & 0xFF
+    name = TYPE_NAMES.get(ftype, f"UNKNOWN(0x{ftype:02x}, skipped)")
+    flag_txt = " [END]" if flags & F_END else ""
+    out = [f"{direction} {name} len={length} flags=0x{flags:02x}{flag_txt} req={rid}",
+           hexdump(frame, direction)]
+    if ftype == T_HEADERS:
+        try:
+            for fname, value in decode_block(frame[HEADER_LEN:]):
+                out.append(f"{direction}     {fname}: {value.decode('latin-1')}")
+        except Malformed as exc:
+            out.append(f"{direction}     (malformed header block: {exc})")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------- request logic
+def parse_request(fields):
+    """Validate a decoded request header block (SPEC 5). Returns (method, path)."""
+    pseudo = {}
+    for name, value in fields:
+        if name.startswith(":"):
+            if name not in (":method", ":path"):
+                raise Malformed(f"pseudo-header {name} is not allowed in a request")
+            if name in pseudo:
+                raise Malformed(f"duplicate {name}")
+            pseudo[name] = value
+    for required in (":method", ":path"):
+        if required not in pseudo:
+            raise Malformed(f"missing {required}")
+    try:
+        method = pseudo[":method"].decode("ascii")
+        path = pseudo[":path"].decode("ascii")
+    except UnicodeDecodeError:
+        raise Malformed(":method and :path must be ASCII") from None
+    if not method:
+        raise Malformed("empty :method")
+    if not path.startswith("/"):
+        raise Malformed(":path must start with '/'")
+    return method, path
+
+
+def resolve(root, target):
+    """Map a :path onto a regular file under root, or None (-> 404)."""
+    path = target.split("?", 1)[0].split("#", 1)[0]
+    path = urllib.parse.unquote(path)
+    if "\0" in path:
+        return None
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    full = os.path.realpath(os.path.join(root, *parts))
+    try:
+        if os.path.commonpath([root, full]) != root:
+            return None                  # escaped the root (.., symlink, drive)
+    except ValueError:
+        return None                      # different drive on Windows
+    if os.path.isdir(full):
+        full = os.path.join(full, "index.html")
+    return full if os.path.isfile(full) else None
+
+
+class Connection:
+    def __init__(self, sock, peer, root, verbose):
+        self.sock = sock
+        self.peer = peer
+        self.root = root
+        self.verbose = verbose
+        self.rfile = sock.makefile("rb")
+
+    def log(self, msg):
+        print(f"[{self.peer}] {msg}", file=sys.stderr, flush=True)
+
+    def send(self, ftype, flags, rid, payload=b""):
+        frame = pack_frame(ftype, flags, rid, payload)
+        if self.verbose:
+            self.log("\n" + describe_frame(">", frame))
+        self.sock.sendall(frame)
+
+    def read_frame(self):
+        """Next frame as (type, flags, rid, payload); None on clean EOF."""
+        head = self.rfile.read(HEADER_LEN)
+        if not head:
+            return None
+        if len(head) < HEADER_LEN:
+            raise EOFError("connection closed inside a frame header")
+        lt, flags, _reserved, rid = FRAME_HEADER.unpack(head)   # reserved: ignored
+        length, ftype = lt >> 8, lt & 0xFF
+        if length > MAX_FRAME_SIZE:
+            raise FramingError(f"frame length {length} exceeds {MAX_FRAME_SIZE}")
+        payload = self.rfile.read(length)
+        if len(payload) < length:
+            raise EOFError("connection closed inside a frame payload")
+        if self.verbose:
+            self.log("\n" + describe_frame("<", head + payload))
+        return ftype, flags, rid, payload
+
+    def run(self):
+        pending = None       # (request id, (method, path) or Malformed)
+        try:
+            while True:
+                frame = self.read_frame()
+                if frame is None:
+                    return
+                ftype, flags, rid, payload = frame
+                if ftype == T_HEADERS:
+                    if rid == 0:
+                        raise FramingError("HEADERS frame on request ID 0")
+                    if pending is not None:
+                        self.respond_error(pending[0], 400,
+                                           "new HEADERS before previous request ended")
+                    try:
+                        request = parse_request(decode_block(payload))
+                    except Malformed as exc:
+                        request = exc
+                    pending = (rid, request)
+                elif ftype == T_DATA:
+                    if pending is None or pending[0] != rid:
+                        self.respond_error(rid, 400, "DATA frame for no open request")
+                        continue
+                    # Request bodies are allowed but this server ignores them.
+                else:
+                    continue     # SPEC 3: unknown type -> payload already consumed, skip
+                if flags & F_END:
+                    rid, request = pending
+                    pending = None
+                    if isinstance(request, Malformed):
+                        self.respond_error(rid, 400, str(request))
+                    else:
+                        self.serve(rid, *request)
+        except FramingError as exc:
+            try:
+                self.respond_error(0, 400, str(exc))
+                self.lingering_close()
+            except OSError:
+                pass
+        except (EOFError, OSError):
+            pass             # peer went away or idle timeout
+        finally:
+            for closer in (self.rfile.close, self.sock.close):
+                try:
+                    closer()
+                except OSError:
+                    pass
+            self.log("connection closed")
+
+    def lingering_close(self):
+        """Send FIN after our 400, then drain briefly. Closing with unread input
+        would make the kernel send RST, which can destroy the 400 in flight."""
+        self.sock.shutdown(socket.SHUT_WR)
+        self.sock.settimeout(1.0)
+        try:
+            while self.sock.recv(65536):
+                pass
+        except OSError:
+            pass
+
+    def common_headers(self, status, ctype, length):
+        return [(":status", str(status)), ("content-type", ctype),
+                ("content-length", str(length)), ("server", SERVER_NAME),
+                ("date", formatdate(usegmt=True))]
+
+    def respond_error(self, rid, status, detail, method="GET", extra=()):
+        body = f"{status} {REASONS[status]}: {detail}\n".encode()
+        fields = self.common_headers(status, "text/plain; charset=utf-8", len(body))
+        fields += list(extra)
+        self.log(f"#{rid} -> {status} ({detail})")
+        if method == "HEAD":
+            self.send(T_HEADERS, F_END, rid, encode_block(fields))
+        else:
+            self.send(T_HEADERS, 0, rid, encode_block(fields))
+            self.send(T_DATA, F_END, rid, body)
+
+    def serve(self, rid, method, target):
+        if method not in ALLOWED_METHODS:
+            return self.respond_error(rid, 405, f"method {method} not supported",
+                                      extra=[("allow", "GET, HEAD")])
+        path = resolve(self.root, target)
+        if path is None:
+            return self.respond_error(rid, 404, target, method)
+        try:
+            f = open(path, "rb")
+        except OSError as exc:
+            return self.respond_error(rid, 404 if isinstance(exc, FileNotFoundError)
+                                      else 500, target, method)
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            if ctype.startswith("text/"):
+                ctype += "; charset=utf-8"
+            fields = encode_block(self.common_headers(200, ctype, size))
+            self.log(f"#{rid} {method} {target} -> 200 ({size} bytes)")
+            if method == "HEAD" or size == 0:
+                return self.send(T_HEADERS, F_END, rid, fields)
+            self.send(T_HEADERS, 0, rid, fields)
+            remaining = size
+            while remaining > 0:
+                chunk = f.read(min(MAX_FRAME_SIZE, remaining))
+                if not chunk:                      # file shrank under us
+                    break
+                remaining -= len(chunk)
+                self.send(T_DATA, F_END if remaining == 0 else 0, rid, chunk)
+            if remaining > 0:
+                self.send(T_DATA, F_END, rid, b"")
+
+
+def listen(port):
+    if socket.has_dualstack_ipv6():
+        return socket.create_server(("", port), family=socket.AF_INET6,
+                                    dualstack_ipv6=True, reuse_port=False)
+    return socket.create_server(("", port))
+
+
+def main(argv):
+    args = argv[1:]
+    verbose = "-v" in args
+    args = [a for a in args if a != "-v"]
+    if len(args) != 2 or not args[1].isdigit():
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    root = os.path.realpath(args[0])
+    port = int(args[1])
+    if not os.path.isdir(root):
+        print(f"bserve: {args[0]} is not a directory", file=sys.stderr)
+        return 2
+    try:
+        server = listen(port)
+    except OSError as exc:
+        print(f"bserve: cannot listen on port {port}: {exc}", file=sys.stderr)
+        return 1
+    server.settimeout(1.0)       # lets Ctrl+C through on Windows
+    print(f"bserve: serving {root} on port {port}", file=sys.stderr, flush=True)
+    try:
+        while True:
+            try:
+                sock, addr = server.accept()
+            except socket.timeout:
+                continue
+            sock.settimeout(IDLE_TIMEOUT)
+            peer = f"{addr[0]}:{addr[1]}"
+            conn = Connection(sock, peer, root, verbose)
+            conn.log("connection opened")
+            threading.Thread(target=conn.run, daemon=True).start()
+    except KeyboardInterrupt:
+        print("bserve: shutting down", file=sys.stderr)
+    finally:
+        server.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

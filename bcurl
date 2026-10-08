@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""bcurl -- a BHTP/1 client (Track 2).
+
+Usage:  bcurl [-v] [-I] [-H 'name: value']... URL [URL ...]
+
+    URL    [bhttp://]host[:port][/path]     (port defaults to 9000)
+    -v     hexdump every frame sent and received to stderr
+    -I     send HEAD and print the response headers to stdout
+    -H     add a request header (repeatable)
+
+Several URLs are fetched one after another over ONE connection, so they must
+all name the same host and port. Response bodies go to stdout, byte-exact.
+
+Exit status: 0 all responses 1xx-3xx, 4 a response was 4xx, 5 a response was
+5xx, 1 cannot connect / connection lost, 2 bad usage, 3 protocol error.
+
+This file is deliberately self-contained: it shares no code with bserve.
+"""
+import argparse
+import socket
+import struct
+import sys
+
+# ---------------------------------------------------------------- wire format
+FRAME_HEADER = struct.Struct(">IBBH")   # (length<<8 | type), flags, reserved, req id
+HEADER_LEN = 8
+MAX_FRAME_SIZE = 16384
+T_HEADERS, T_DATA = 0x01, 0x02
+TYPE_NAMES = {T_HEADERS: "HEADERS", T_DATA: "DATA"}
+F_END = 0x01
+STATIC_TABLE = (None, ":method", ":path", ":status", "host", "user-agent",
+                "accept", "content-type", "content-length", "server", "date")
+NAME_TO_INDEX = {name: i for i, name in enumerate(STATIC_TABLE) if name}
+
+DEFAULT_PORT = 9000
+USER_AGENT = "bcurl/1.0"
+EXIT_OK, EXIT_CONN, EXIT_USAGE, EXIT_PROTO = 0, 1, 2, 3
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class ConnectionLost(Exception):
+    pass
+
+
+def encode_block(fields):
+    out = bytearray()
+    for name, value in fields:
+        value = value.encode("latin-1") if isinstance(value, str) else value
+        index = NAME_TO_INDEX.get(name)
+        if index:
+            out.append(index)
+        else:
+            raw = name.encode("ascii")
+            if not 1 <= len(raw) <= 255:
+                raise ValueError(f"header name length must be 1..255: {name!r}")
+            out += bytes([0, len(raw)]) + raw
+        if len(value) > 0xFFFF:
+            raise ValueError(f"header value too long for {name!r}")
+        out += len(value).to_bytes(2, "big") + value
+    return bytes(out)
+
+
+def decode_block(payload):
+    fields, i, n = [], 0, len(payload)
+    try:
+        while i < n:
+            index = payload[i]
+            i += 1
+            if index == 0:
+                name_len = payload[i]
+                if name_len == 0:
+                    raise ProtocolError("literal header name has length 0")
+                name = payload[i + 1:i + 1 + name_len]
+                if len(name) != name_len:
+                    raise IndexError
+                name = name.decode("ascii").lower()
+                i += 1 + name_len
+            elif index < len(STATIC_TABLE):
+                name = STATIC_TABLE[index]
+            else:
+                raise ProtocolError(f"unknown static table index {index}")
+            value_len = int.from_bytes(payload[i:i + 2], "big")
+            if i + 2 > n or i + 2 + value_len > n:
+                raise IndexError
+            fields.append((name, payload[i + 2:i + 2 + value_len]))
+            i += 2 + value_len
+    except (IndexError, UnicodeDecodeError):
+        raise ProtocolError("malformed header block") from None
+    return fields
+
+
+def hexdump(data, prefix):
+    lines = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hexes = " ".join(f"{b:02x}" for b in chunk[:8])
+        if len(chunk) > 8:
+            hexes += "  " + " ".join(f"{b:02x}" for b in chunk[8:])
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{prefix} {off:08x}  {hexes:<49} |{text}|")
+    return "\n".join(lines)
+
+
+def describe_frame(direction, frame):
+    lt, flags, _reserved, rid = FRAME_HEADER.unpack(frame[:HEADER_LEN])
+    length, ftype = lt >> 8, lt & 0xFF
+    name = TYPE_NAMES.get(ftype, f"UNKNOWN(0x{ftype:02x}, skipped)")
+    flag_txt = " [END]" if flags & F_END else ""
+    out = [f"{direction} {name} len={length} flags=0x{flags:02x}{flag_txt} req={rid}",
+           hexdump(frame, direction)]
+    if ftype == T_HEADERS:
+        try:
+            for fname, value in decode_block(frame[HEADER_LEN:]):
+                out.append(f"{direction}     {fname}: {value.decode('latin-1')}")
+        except ProtocolError as exc:
+            out.append(f"{direction}     ({exc})")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------- client
+def parse_url(url):
+    """'[bhttp://]host[:port][/path]' -> (host, port, path)."""
+    if "://" in url:
+        scheme, url = url.split("://", 1)
+        if scheme.lower() not in ("bhttp", "http"):
+            raise ValueError(f"unsupported scheme {scheme!r}")
+    authority, slash, rest = url.partition("/")
+    path = "/" + rest if slash else "/"
+    if authority.startswith("["):                       # [::1]:9000
+        host, _, tail = authority[1:].partition("]")
+        port = tail[1:] if tail.startswith(":") else ""
+    elif authority.count(":") == 1:
+        host, port = authority.split(":")
+    else:
+        host, port = authority, ""
+    if not host:
+        raise ValueError("missing host")
+    if port and not port.isdigit():
+        raise ValueError(f"bad port {port!r}")
+    return host, int(port) if port else DEFAULT_PORT, path
+
+
+class Client:
+    def __init__(self, host, port, verbose):
+        self.verbose = verbose
+        self.authority = f"{host}:{port}" if ":" not in host else f"[{host}]:{port}"
+        self.sock = socket.create_connection((host, port), timeout=30)
+        self.rfile = self.sock.makefile("rb")
+        self.next_id = 1
+        self.say(f"connected to {self.authority}")
+
+    def say(self, msg):
+        if self.verbose:
+            print(f"* {msg}", file=sys.stderr, flush=True)
+
+    def send(self, ftype, flags, rid, payload):
+        frame = FRAME_HEADER.pack(len(payload) << 8 | ftype, flags, 0, rid) + payload
+        if self.verbose:
+            print(describe_frame(">", frame), file=sys.stderr, flush=True)
+        self.sock.sendall(frame)
+
+    def read_frame(self):
+        head = self.rfile.read(HEADER_LEN)
+        if len(head) < HEADER_LEN:
+            raise ConnectionLost("server closed the connection mid-response")
+        lt, flags, _reserved, rid = FRAME_HEADER.unpack(head)     # reserved: ignored
+        length, ftype = lt >> 8, lt & 0xFF
+        if length > MAX_FRAME_SIZE:
+            raise ProtocolError(f"frame length {length} exceeds {MAX_FRAME_SIZE}")
+        payload = self.rfile.read(length)
+        if len(payload) < length:
+            raise ConnectionLost("server closed the connection mid-frame")
+        if self.verbose:
+            print(describe_frame("<", head + payload), file=sys.stderr, flush=True)
+        return ftype, flags, rid, payload
+
+    def request(self, method, path, extra_headers, out, print_headers):
+        """Send one request, stream the body to out, return the status code."""
+        rid = self.next_id
+        self.next_id = self.next_id % 0xFFFF + 1        # 1..65535, wraps to 1
+        fields = [(":method", method), (":path", path), ("host", self.authority),
+                  ("user-agent", USER_AGENT), ("accept", "*/*")] + extra_headers
+        self.send(T_HEADERS, F_END, rid, encode_block(fields))
+
+        status = None
+        while True:
+            ftype, flags, frid, payload = self.read_frame()
+            if ftype not in (T_HEADERS, T_DATA):
+                continue                         # SPEC 3: skip unknown frame types
+            if frid not in (rid, 0):
+                raise ProtocolError(f"response for request {frid}, expected {rid}")
+            if ftype == T_HEADERS:
+                if status is not None:
+                    raise ProtocolError("second HEADERS frame in one response")
+                headers = decode_block(payload)
+                codes = [v for n, v in headers if n == ":status"]
+                if len(codes) != 1 or not codes[0].isdigit() or len(codes[0]) != 3:
+                    raise ProtocolError("response must carry exactly one 3-digit :status")
+                status = int(codes[0])
+                if frid == 0:
+                    self.say("server reported a connection-level error")
+                if print_headers:
+                    for name, value in headers:
+                        out.write(f"{name}: {value.decode('latin-1')}\r\n".encode("latin-1"))
+                    out.write(b"\r\n")
+            else:
+                if status is None:
+                    raise ProtocolError("DATA frame before HEADERS")
+                out.write(payload)
+            if flags & F_END:
+                if status is None:
+                    raise ProtocolError("response ended without HEADERS")
+                out.flush()
+                self.say(f"request {rid} complete: status {status}")
+                return status
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="bcurl", add_help=True,
+                                     description="BHTP/1 client")
+    parser.add_argument("-v", action="store_true", help="hexdump every frame to stderr")
+    parser.add_argument("-I", action="store_true", help="HEAD request; print headers")
+    parser.add_argument("-H", action="append", default=[], metavar="'name: value'",
+                        help="extra request header")
+    parser.add_argument("urls", nargs="+", metavar="URL")
+    args = parser.parse_args(argv[1:])
+
+    try:
+        targets = [parse_url(u) for u in args.urls]
+        extra = []
+        for h in args.H:
+            name, sep, value = h.partition(":")
+            if not sep or not name.strip():
+                raise ValueError(f"bad header {h!r}, expected 'name: value'")
+            extra.append((name.strip().lower(), value.strip()))
+    except ValueError as exc:
+        print(f"bcurl: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if len({(h, p) for h, p, _ in targets}) != 1:
+        print("bcurl: all URLs must use the same host:port (one connection only)",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    host, port, _ = targets[0]
+    try:
+        client = Client(host, port, args.v)
+    except OSError as exc:
+        print(f"bcurl: cannot connect to {host}:{port}: {exc}", file=sys.stderr)
+        return EXIT_CONN
+
+    worst = 0
+    out = sys.stdout.buffer
+    try:
+        for _, _, path in targets:
+            status = client.request("HEAD" if args.I else "GET", path, extra, out, args.I)
+            worst = max(worst, status)
+            if status >= 400:
+                print(f"bcurl: {path}: server returned {status}", file=sys.stderr)
+    except ProtocolError as exc:
+        print(f"bcurl: protocol error: {exc}", file=sys.stderr)
+        return EXIT_PROTO
+    except (ConnectionLost, OSError) as exc:
+        print(f"bcurl: {exc}", file=sys.stderr)
+        return EXIT_CONN
+    finally:
+        client.close()
+    if worst >= 500:
+        return 5
+    if worst >= 400:
+        return 4
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except BrokenPipeError:              # e.g. bcurl ... | head
+        sys.exit(0)
