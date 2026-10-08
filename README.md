@@ -2,9 +2,9 @@
 
 | Hand-in item | File |
 |---|---|
-| 1. The spec (two pages) | `SPEC.md` |
+| 1. The spec (two pages) | `SPEC.md`, printed as `SPEC.pdf` |
 | 2. The programs | `bserve` (Track 1, server) and `bcurl` (Track 2, client) |
-| 3. Annotated hexdump of one complete request and response | `HEXDUMP.md` |
+| 3. Annotated hexdump of one complete request and response | `HEXDUMP.md`, printed as `HEXDUMP.pdf` |
 
 Both programs are single-file Python 3 (3.8+), standard library only. They share **no
 code**: each was written against `SPEC.md` alone, so either one can be paired with a
